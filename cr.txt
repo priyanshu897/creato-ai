@@ -1,0 +1,536 @@
+# ================================================================
+# LangGraph Content Ideation and Publishing Agent with Media Upload
+# ================================================================
+
+import os
+import requests
+import json
+from typing import List, TypedDict, Union
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+from langchain_groq import ChatGroq
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
+from langgraph.graph import StateGraph, END
+import time
+import mimetypes
+
+# --- Pydantic Schemas for Structured LLM Output ---
+
+class Idea(BaseModel):
+    """A single content idea."""
+    title: str = Field(..., description="A short, catchy title for the content.")
+    summary: str = Field(..., description="A brief summary of the content idea.")
+
+class IdeasList(BaseModel):
+    """A list of content ideas."""
+    ideas: List[Idea] = Field(..., description="A list of 5 content ideas.")
+
+class LinkedInPost(BaseModel):
+    """A draft of a LinkedIn post."""
+    post_text: str = Field(..., description="The full text of the LinkedIn post.")
+
+class YoutubeScript(BaseModel):
+    """A draft of a YouTube script."""
+    script_text: str = Field(..., description="The full text of the YouTube video script.")
+
+# --- LangGraph State ---
+
+class AgentState(TypedDict):
+    """Represents the state of our graph."""
+    user_niche: str
+    platform_choice: str
+    content_ideas: Union[List[Idea], None]
+    selected_idea: Union[Idea, None]
+    post_draft: Union[str, None]
+    script_draft: Union[str, None]
+    user_input: str
+    error: Union[str, None]
+    media_url: Union[str, None] # New field for user-provided media link
+    media_asset_urn: Union[str, None] # New field to store the LinkedIn media URN
+
+# --- Load Environment Variables ---
+
+load_dotenv()
+os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY")
+
+# --- Node Functions ---
+
+# 1. Starting Node: Captures initial user input
+def start_chat(state: AgentState) -> AgentState:
+    """
+    Initial node to capture the user's niche, platform choice, and an optional media URL.
+    """
+    print("Agent: Hello! I'm your content assistant.")
+    print("Agent: What's your niche or topic of interest?")
+    user_niche = input("You: ")
+    
+    print("Agent: Great! Do you want to generate ideas for 'linkedin' or 'youtube'?")
+    platform_choice = input("You: ").lower()
+
+    media_url = None
+    if platform_choice == "linkedin":
+        print("Agent: Do you have an image or video URL for this post? (Leave blank if not)")
+        media_url = input("You: ")
+        if not media_url.strip():
+            media_url = None
+    
+    # Store initial state
+    return {
+        **state,
+        "user_niche": user_niche,
+        "platform_choice": platform_choice,
+        "media_url": media_url,
+    }
+
+# 2. Fetch Ideas Node (LinkedIn Branch)
+def fetch_linkedin_ideas(state: AgentState) -> AgentState:
+    """Fetches trending LinkedIn ideas using an LLM."""
+    print(f"Agent: Fetching trending LinkedIn ideas for '{state['user_niche']}'...")
+    llm = ChatGroq(model="llama3-8b-8192", temperature=0.5)
+    parser = JsonOutputParser(pydantic_object=IdeasList)
+    
+    prompt = PromptTemplate(
+        template="""
+        You are a content trend analyst for LinkedIn.
+        Based on the niche: {user_niche}, generate 5 highly engaging post ideas.
+        Return ONLY a JSON object that adheres strictly to the following schema. Do NOT include any conversational text, code block syntax, or any other formatting.
+        
+        {format_instructions}
+        """,
+        input_variables=["user_niche"],
+        partial_variables={"format_instructions": parser.get_format_instructions()},
+    )
+    chain = prompt | llm | parser
+    ideas_dict = chain.invoke({"user_niche": state["user_niche"]})
+    
+    if not ideas_dict:
+        print("Error: LLM returned an empty or invalid response.")
+        return {**state, "error": "LLM failed to generate ideas."}
+
+    try:
+        ideas_list = IdeasList.model_validate(ideas_dict)
+    except Exception as e:
+        print(f"Validation failed: {e}")
+        return {**state, "error": "LLM output validation failed."}
+
+    # Simulate user selection
+    print("\nAgent: Here are some ideas:")
+    for i, idea in enumerate(ideas_list.ideas):
+        print(f"  {i+1}. {idea.title}")
+    
+    selected_index = int(input("You: Please select an idea (1-5) or 0 to end: "))
+    
+    if 1 <= selected_index <= 5:
+        return {
+            **state,
+            "content_ideas": ideas_list.ideas,
+            "selected_idea": ideas_list.ideas[selected_index - 1],
+            "user_input": "draft"
+        }
+    else:
+        return {**state, "user_input": "end"}
+
+# 3. Draft LinkedIn Post Node
+def draft_linkedin_post(state: AgentState) -> AgentState:
+    """Drafts a LinkedIn post based on the selected idea."""
+    print("Agent: Drafting a LinkedIn post based on your selection...")
+    llm = ChatGroq(model="llama3-8b-8192", temperature=0.5)
+    
+    prompt = PromptTemplate(
+        template="""
+        You are a master copywriter for LinkedIn.
+        Based on the following idea, draft a professional and engaging LinkedIn post.
+        Use relevant hashtags and a clear call to action.
+        Return ONLY the post text and nothing else.
+        
+        Idea: {idea_title} - {idea_summary}
+        """,
+        input_variables=["idea_title", "idea_summary"],
+    )
+    
+    chain = prompt | llm
+    post_draft_response = chain.invoke({
+        "idea_title": state["selected_idea"].title,
+        "idea_summary": state["selected_idea"].summary,
+    })
+    
+    if not post_draft_response:
+        return {**state, "error": "LLM failed to draft the post."}
+
+    post_draft = post_draft_response.content
+
+    print("\nAgent: Here's the drafted post:")
+    print("-" * 50)
+    print(post_draft)
+    print("-" * 50)
+
+    # Determine next step based on whether a media URL was provided
+    if state["media_url"]:
+        print("Agent: Media URL detected. Proceeding to upload media.")
+        return {**state, "post_draft": post_draft, "user_input": "upload_media"}
+    else:
+        print("Agent: No media URL provided. Proceeding to human-in-the-loop publish node.")
+        return {**state, "post_draft": post_draft, "user_input": "ask_publish"}
+
+# 4. Human-in-the-Loop Publish Node (LinkedIn)
+def human_in_loop_linkedin_publish(state: AgentState) -> AgentState:
+    """Asks the user for final publish approval."""
+    print("Agent: Are you happy with this post? (publish/refine/end)")
+    user_response = input("You: ").lower()
+    return {**state, "user_input": user_response}
+
+# --- LinkedIn API functions ---
+
+def get_linkedin_access_token():
+    """Returns the live access token from a secure environment variable."""
+    access_token = os.getenv("LINKEDIN_ACCESS_TOKEN")
+    if not access_token:
+        raise ValueError("LINKEDIN_ACCESS_TOKEN not found in environment variables.")
+    return access_token
+
+def get_linkedin_user_id(access_token):
+    """
+    A temporary function to get the user's URN (ID).
+    For a real application, you would use LinkedIn's 'me' endpoint to get this.
+    """
+    urn = os.getenv("LINKEDIN_URN")
+    # Placeholder URN. Replace this with your own for a real test.
+    return f"urn:li:person:{urn}"
+
+# 5. New Node to upload media to LinkedIn
+def upload_media_to_linkedin(state: AgentState) -> AgentState:
+    """
+    Fetches media from a URL and uploads it to LinkedIn's asset service.
+    Returns the state with the new media_asset_urn.
+    """
+    print("Agent: Uploading your media file to LinkedIn...")
+    try:
+        access_token = get_linkedin_access_token()
+        user_urn = get_linkedin_user_id(access_token)
+    except ValueError as e:
+        print(f"Agent: Failed to get credentials. Error: {e}")
+        return {**state, "error": "LinkedIn media upload failed: credentials not set."}
+
+    if user_urn == "urn:li:person:YOUR_LINKEDIN_USER_ID":
+        print("Error: The LinkedIn user URN placeholder has not been replaced.")
+        return {**state, "error": "LinkedIn publishing failed: user URN not set."}
+
+    # Step 1: Download the media from the provided URL
+    try:
+        media_response = requests.get(state["media_url"], stream=True)
+        media_response.raise_for_status()
+        print("Agent: Successfully fetched media content.")
+    except requests.exceptions.RequestException as e:
+        print(f"Agent: Failed to download media from URL. Error: {e}")
+        return {**state, "error": "Media download failed."}
+
+    # Infer the MIME type from the file extension or the content type header
+    content_type = media_response.headers.get('Content-Type')
+    if not content_type:
+        content_type, _ = mimetypes.guess_type(state["media_url"])
+    
+    if not content_type:
+        print("Agent: Could not determine media type. Defaulting to image/jpeg.")
+        content_type = "image/jpeg"
+
+    media_recipe = "urn:li:digitalmediaRecipe:feedshare-image"
+    if content_type.startswith('video'):
+        media_recipe = "urn:li:digitalmediaRecipe:feedshare-video"
+    
+    # Step 2: Register the upload with LinkedIn
+    register_url = "https://api.linkedin.com/v2/assets?action=registerUpload"
+    register_payload = {
+        "registerUploadRequest": {
+            "recipes": [media_recipe],
+            "owner": user_urn,
+            "serviceRelationships": [
+                {
+                    "relationshipType": "OWNER",
+                    "identifier": "urn:li:userGeneratedContent"
+                }
+            ]
+        }
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "X-Restli-Protocol-Version": "2.0.0"
+    }
+
+    try:
+        register_response = requests.post(register_url, headers=headers, json=register_payload)
+        register_response.raise_for_status()
+        register_data = register_response.json()
+        
+        media_asset_urn = register_data["value"]["asset"]
+        upload_url = register_data["value"]["uploadMechanism"]["com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"]["uploadUrl"]
+        
+        print(f"Agent: Upload registered. Asset URN: {media_asset_urn}")
+    except requests.exceptions.RequestException as e:
+        print(f"Agent: Failed to register media upload. Error: {e}")
+        return {**state, "error": "Media upload registration failed."}
+
+    # Step 3: Upload the file
+    upload_headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": content_type
+    }
+    
+    try:
+        # Re-fetch content to upload as a single block
+        media_response = requests.get(state["media_url"])
+        media_response.raise_for_status()
+        
+        upload_response = requests.put(upload_url, headers=upload_headers, data=media_response.content)
+        upload_response.raise_for_status()
+        print("Agent: Media successfully uploaded.")
+    except requests.exceptions.RequestException as e:
+        print(f"Agent: Failed to upload media. Error: {e}")
+        return {**state, "error": "Media upload failed."}
+
+    return {
+        **state,
+        "media_asset_urn": media_asset_urn,
+        "user_input": "ask_publish" # Proceed to get user approval
+    }
+
+# 6. Publish to LinkedIn Node
+def publish_to_linkedin(state: AgentState) -> AgentState:
+    """Publishes the post to LinkedIn using the actual API."""
+    print("Agent: Publishing the post to LinkedIn...")
+    
+    try:
+        access_token = get_linkedin_access_token()
+        user_urn = get_linkedin_user_id(access_token)
+    except ValueError as e:
+        print(f"Agent: Failed to get credentials. Error: {e}")
+        return {**state, "error": "LinkedIn publishing failed: credentials not set."}
+
+    api_url = "https://api.linkedin.com/v2/ugcPosts"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "X-Restli-Protocol-Version": "2.0.0"
+    }
+    
+    payload = {
+        "author": user_urn,
+        "lifecycleState": "PUBLISHED",
+        "specificContent": {
+            "com.linkedin.ugc.ShareContent": {
+                "shareCommentary": {
+                    "text": state["post_draft"]
+                },
+                "shareMediaCategory": "NONE"
+            }
+        },
+        "visibility": {
+            "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
+        }
+    }
+    
+    # Check if a media asset was uploaded and update the payload
+    if state["media_asset_urn"]:
+        print("Agent: Attaching uploaded media asset to the post.")
+        share_media_category = "IMAGE"
+        # A simple check for video based on URL, you could improve this
+        if state["media_url"] and state["media_url"].lower().endswith(('.mp4', '.mov', '.avi', '.webm')):
+            share_media_category = "VIDEO"
+
+        payload["specificContent"]["com.linkedin.ugc.ShareContent"]["shareMediaCategory"] = share_media_category
+        payload["specificContent"]["com.linkedin.ugc.ShareContent"]["media"] = [
+            {
+                "status": "READY",
+                "media": state["media_asset_urn"]
+            }
+        ]
+
+    try:
+        response = requests.post(api_url, headers=headers, json=payload)
+        response.raise_for_status()
+        print("Agent: Post successfully published on LinkedIn.")
+        print(f"Agent: Response: {response.json()}")
+    except requests.exceptions.RequestException as e:
+        print("Agent: Failed to publish post to LinkedIn.")
+        print(f"Agent: Error: {e}")
+        if hasattr(e.response, 'text'):
+            print(f"Agent: Response text: {e.response.text}")
+        return {**state, "error": "LinkedIn publishing failed."}
+
+    return {**state, "user_input": "end"}
+
+# 7. Fetch Ideas Node (YouTube Branch)
+def fetch_youtube_ideas(state: AgentState) -> AgentState:
+    """Fetches trending YouTube ideas using an LLM."""
+    print(f"Agent: Fetching trending YouTube ideas for '{state['user_niche']}'...")
+    llm = ChatGroq(model="llama3-8b-8192", temperature=0.5)
+    parser = JsonOutputParser(pydantic_object=IdeasList)
+    
+    prompt = PromptTemplate(
+        template="""
+        You are a content trend analyst for YouTube.
+        Based on the niche: {user_niche}, generate 5 video ideas that are currently trending.
+        Return a JSON object adhering strictly to these instructions: {format_instructions}
+        """,
+        input_variables=["user_niche"],
+        partial_variables={"format_instructions": parser.get_format_instructions()},
+    )
+    chain = prompt | llm | parser
+    ideas_dict = chain.invoke({"user_niche": state["user_niche"]})
+
+    if not ideas_dict:
+        print("Error: LLM returned an empty or invalid response.")
+        return {**state, "error": "LLM failed to generate ideas."}
+    
+    ideas_list = IdeasList.model_validate(ideas_dict)
+    
+    # Simulate user selection
+    print("\nAgent: Here are some ideas:")
+    for i, idea in enumerate(ideas_list.ideas):
+        print(f"  {i+1}. {idea.title}")
+    
+    selected_index = int(input("You: Please select an idea (1-5): "))
+    selected_idea = ideas_list.ideas[selected_index - 1]
+    
+    return {**state, "selected_idea": selected_idea, "user_input": "draft_script"}
+
+# 8. Draft YouTube Script Node
+def draft_youtube_script(state: AgentState) -> AgentState:
+    """Drafts a YouTube script based on the selected idea."""
+    print("Agent: Drafting a full YouTube script based on your selection...")
+    llm = ChatGroq(model="llama3-8b-8192", temperature=0.5)
+    parser = JsonOutputParser(pydantic_object=YoutubeScript)
+    
+    prompt = PromptTemplate(
+        template="""
+        You are a YouTube scriptwriter.
+        Based on the following idea, write a detailed script including an intro, main points, and a conclusion.
+        Return a JSON object adhering strictly to these instructions: {format_instructions}
+        """,
+        input_variables=["idea_title", "idea_summary"],
+        partial_variables={"format_instructions": parser.get_format_instructions()},
+    )
+    chain = prompt | llm | parser
+    script_draft_dict = chain.invoke({
+        "idea_title": state["selected_idea"].title,
+        "idea_summary": state["selected_idea"].summary,
+    })
+    
+    if not script_draft_dict:
+        return {**state, "error": "LLM failed to draft the script."}
+    
+    script_draft = YoutubeScript.model_validate(script_draft_dict)
+
+    print("\nAgent: Here's the first draft of the script:")
+    print("-" * 50)
+    print(script_draft.script_text[:500] + "...") # Show only a snippet
+    print("-" * 50)
+    
+    return {**state, "script_draft": script_draft.script_text, "user_input": "refine_script"}
+
+# 9. Human-in-the-Loop Refinement Node (YouTube)
+def human_in_loop_youtube_refine(state: AgentState) -> AgentState:
+    """Allows the user to cross-question and refine the script."""
+    print("Agent: We can now refine the script. What changes would you like to make?")
+    print("(Type 'end' to finish or 'show' to see the full script.)")
+    user_response = input("You: ").lower()
+    
+    if user_response == "end":
+        return {**state, "user_input": "end"}
+    elif user_response == "show":
+        print("\nAgent: Here is the full script:")
+        print("-" * 50)
+        print(state["script_draft"])
+        print("-" * 50)
+        return {**state, "user_input": "refine_script_loop"} # loop back
+    else:
+        # Simulate LLM refinement (this would be a separate LLM call in a full system)
+        print("Agent: Refining the script based on your feedback...")
+        return {**state, "user_input": "refine_script_loop"}
+
+# --- Graph Definition ---
+
+workflow = StateGraph(AgentState)
+
+# Define the nodes for our workflow
+workflow.add_node("start_chat", start_chat)
+workflow.add_node("fetch_linkedin_ideas", fetch_linkedin_ideas)
+workflow.add_node("draft_linkedin_post", draft_linkedin_post)
+workflow.add_node("human_in_loop_linkedin_publish", human_in_loop_linkedin_publish)
+workflow.add_node("upload_media_to_linkedin", upload_media_to_linkedin) # New node
+workflow.add_node("publish_to_linkedin", publish_to_linkedin)
+workflow.add_node("fetch_youtube_ideas", fetch_youtube_ideas)
+workflow.add_node("draft_youtube_script", draft_youtube_script)
+workflow.add_node("human_in_loop_youtube_refine", human_in_loop_youtube_refine)
+
+# Set the entry point of the graph
+workflow.set_entry_point("start_chat")
+
+# --- Define the edges and branching logic ---
+
+# Branching from the starting chat based on platform choice
+workflow.add_conditional_edges(
+    "start_chat",
+    lambda state: state["platform_choice"],
+    {
+        "linkedin": "fetch_linkedin_ideas",
+        "youtube": "fetch_youtube_ideas",
+    }
+)
+
+# LinkedIn branch flow
+workflow.add_edge("fetch_linkedin_ideas", "draft_linkedin_post")
+# New branching logic to check for media before publishing
+workflow.add_conditional_edges(
+    "draft_linkedin_post",
+    lambda state: state["user_input"],
+    {
+        "upload_media": "upload_media_to_linkedin",
+        "ask_publish": "human_in_loop_linkedin_publish"
+    }
+)
+# Edge from media upload to human-in-the-loop
+workflow.add_edge("upload_media_to_linkedin", "human_in_loop_linkedin_publish")
+
+# LinkedIn publish loop
+workflow.add_conditional_edges(
+    "human_in_loop_linkedin_publish",
+    lambda state: state["user_input"],
+    {
+        "publish": "publish_to_linkedin",
+        "refine": "draft_linkedin_post", # Loop back to refine
+        "end": END
+    }
+)
+workflow.add_edge("publish_to_linkedin", END)
+
+# YouTube branch flow
+workflow.add_edge("fetch_youtube_ideas", "draft_youtube_script")
+workflow.add_edge("draft_youtube_script", "human_in_loop_youtube_refine")
+
+# YouTube refinement loop
+workflow.add_conditional_edges(
+    "human_in_loop_youtube_refine",
+    lambda state: state["user_input"],
+    {
+        "refine_script_loop": "draft_youtube_script", # Loop back to refine
+        "end": END
+    }
+)
+
+# Compile the graph
+app = workflow.compile()
+
+# --- Main Execution ---
+
+if __name__ == "__main__":
+    print("Welcome to the Agent Designer. Let's build a content plan.")
+    
+    final_state = app.invoke({})
+    
+    print("\nWorkflow finished.")
+    print(f"Final state: {final_state}")
+
+
