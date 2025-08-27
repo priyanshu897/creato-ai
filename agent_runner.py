@@ -580,16 +580,7 @@ class AgentRunner:
         except Exception as e:
             return {"error": str(e)}
     
-    def _extract_niche(self, user_input: str) -> str:
-        """Extract niche from user input"""
-        niches = ["ai", "technology", "marketing", "business", "health", "fitness", "cooking", "travel"]
-        user_input_lower = user_input.lower()
-        
-        for niche in niches:
-            if niche in user_input_lower:
-                return niche
-        
-        return "general"
+    # Note: synchronous _extract_niche removed to avoid overriding the async version.
     
     def _extract_idea(self, user_input: str) -> str:
         """Extract content idea from user input"""

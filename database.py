@@ -1,7 +1,8 @@
 import json
 import os
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple, Callable
+from pathlib import Path
 from models import WorkflowThread, AgentResult, AgentMessage, Workflow
 
 class DatabaseManager:
@@ -13,6 +14,7 @@ class DatabaseManager:
         self.workflow_templates: Dict[str, Workflow] = {}
         self.agent_results: Dict[str, List[AgentResult]] = {}
         self.messages: Dict[str, List[AgentMessage]] = {}
+        self._subscribers: Dict[str, List[Callable[..., None]]] = {}
         
         # Load existing data if available
         self.load_data()
@@ -69,6 +71,7 @@ class DatabaseManager:
         try:
             self.workflows[workflow.id] = workflow
             self.save_data()
+            self._notify_subscribers(workflow.id, "workflow_saved", workflow.dict())
             return True
         except Exception as e:
             print(f"Error saving workflow: {e}")
@@ -95,6 +98,7 @@ class DatabaseManager:
             
             workflow.updated_at = datetime.now(timezone.utc)
             self.save_data()
+            self._notify_subscribers(workflow_id, "workflow_updated", updates)
             return True
         except Exception as e:
             print(f"Error updating workflow: {e}")
@@ -113,19 +117,39 @@ class DatabaseManager:
                 del self.messages[workflow_id]
             
             self.save_data()
+            self._notify_subscribers(workflow_id, "workflow_deleted", {"workflow_id": workflow_id})
             return True
         except Exception as e:
             print(f"Error deleting workflow: {e}")
             return False
+
+    # --- Agent execution helpers ---
+    def get_next_agent(self, workflow_id: str) -> Optional[str]:
+        """Get the next agent to execute in a workflow"""
+        workflow = self.get_workflow(workflow_id)
+        if not workflow or not workflow.agents:
+            return None
+        executed_agents = {ar.agent_name for ar in self.get_agent_results(workflow_id)}
+        for agent in workflow.agents:
+            if agent not in executed_agents:
+                return agent
+        return None
     
     def add_agent_result(self, workflow_id: str, agent_result: AgentResult) -> bool:
-        """Add an agent result to a workflow"""
+        """Add an agent result to a workflow with validation and progression."""
+        if workflow_id not in self.workflows:
+            print(f"Error: Workflow {workflow_id} does not exist")
+            return False
         try:
             if workflow_id not in self.agent_results:
                 self.agent_results[workflow_id] = []
-            
             self.agent_results[workflow_id].append(agent_result)
+            # Determine if there is a next agent; if none, mark completed
+            next_agent = self.get_next_agent(workflow_id)
+            if not next_agent:
+                self.update_workflow(workflow_id, {"status": "completed"})
             self.save_data()
+            self._notify_subscribers(workflow_id, "agent_result", agent_result.dict())
             return True
         except Exception as e:
             print(f"Error adding agent result: {e}")
@@ -143,6 +167,7 @@ class DatabaseManager:
             
             self.messages[workflow_id].append(message)
             self.save_data()
+            self._notify_subscribers(workflow_id, "message", message.dict())
             return True
         except Exception as e:
             print(f"Error adding message: {e}")
@@ -236,6 +261,121 @@ class DatabaseManager:
             "average_execution_time": avg_execution_time,
             "templates_available": len(self.workflow_templates)
         }
+
+    # --- Validation ---
+    def validate_workflow_data(self, workflow_data: Dict[str, Any]) -> Tuple[bool, str]:
+        required_fields = ["id", "user_input", "status", "created_at"]
+        for field in required_fields:
+            if field not in workflow_data:
+                return False, f"Missing required field: {field}"
+        if not isinstance(workflow_data["user_input"], str) or len(workflow_data["user_input"].strip()) == 0:
+            return False, "User input must be a non-empty string"
+        valid_statuses = ["created", "processing", "completed", "error", "cancelled"]
+        if workflow_data["status"] not in valid_statuses:
+            return False, f"Invalid status. Must be one of: {', '.join(valid_statuses)}"
+        return True, ""
+
+    # --- Backup & Restore ---
+    def _get_all_data(self) -> Dict[str, Any]:
+        return {
+            "workflows": {wid: w.dict() for wid, w in self.workflows.items()},
+            "agent_results": {wid: [ar.model_dump() for ar in ars] for wid, ars in self.agent_results.items()},
+            "messages": {wid: [m.dict() for m in msgs] for wid, msgs in self.messages.items()},
+            "templates": {tid: t.dict() for tid, t in self.workflow_templates.items()},
+        }
+
+    def create_backup(self, backup_path: str) -> bool:
+        try:
+            backup_dir = Path(backup_path)
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            backup_file = backup_dir / f"workflow_backup_{timestamp}.json"
+            with backup_file.open('w', encoding='utf-8') as f:
+                json.dump(self._get_all_data(), f, indent=2, default=str)
+            print(f"Backup created: {backup_file}")
+            return True
+        except Exception as e:
+            print(f"Error creating backup: {e}")
+            return False
+
+    def restore_from_backup(self, backup_file: str) -> bool:
+        try:
+            if not os.path.exists(backup_file):
+                print(f"Backup file not found: {backup_file}")
+                return False
+            with open(backup_file, 'r', encoding='utf-8') as f:
+                backup_data = json.load(f)
+            self.workflows.clear()
+            self.agent_results.clear()
+            self.messages.clear()
+            for wid, w_data in backup_data.get("workflows", {}).items():
+                self.workflows[wid] = WorkflowThread(**w_data)
+            for wid, ar_data in backup_data.get("agent_results", {}).items():
+                self.agent_results[wid] = [AgentResult(**ar) for ar in ar_data]
+            for wid, msg_data in backup_data.get("messages", {}).items():
+                self.messages[wid] = [AgentMessage(**msg) for msg in msg_data]
+            print(f"Restored from backup: {backup_file}")
+            self.save_data()
+            return True
+        except Exception as e:
+            print(f"Error restoring from backup: {e}")
+            return False
+
+    # --- Export / Import ---
+    def export_workflow(self, workflow_id: str, export_path: str) -> bool:
+        workflow = self.get_workflow(workflow_id)
+        if not workflow:
+            return False
+        try:
+            export_data = {
+                "workflow": workflow.dict(),
+                "agent_results": [ar.model_dump() for ar in self.get_agent_results(workflow_id)],
+                "messages": [m.dict() for m in self.get_messages(workflow_id)]
+            }
+            with open(export_path, 'w', encoding='utf-8') as f:
+                json.dump(export_data, f, indent=2, default=str)
+            print(f"Exported workflow {workflow_id} to {export_path}")
+            return True
+        except Exception as e:
+            print(f"Error exporting workflow: {e}")
+            return False
+
+    def import_workflow(self, import_path: str) -> Optional[str]:
+        try:
+            if not os.path.exists(import_path):
+                print(f"Import file not found: {import_path}")
+                return None
+            with open(import_path, 'r', encoding='utf-8') as f:
+                import_data = json.load(f)
+            workflow_data = import_data["workflow"]
+            new_workflow_id = f"imported_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+            workflow_data["id"] = new_workflow_id
+            workflow = WorkflowThread(**workflow_data)
+            self.save_workflow(workflow)
+            for ar_data in import_data.get("agent_results", []):
+                agent_result = AgentResult(**ar_data)
+                self.add_agent_result(new_workflow_id, agent_result)
+            for msg_data in import_data.get("messages", []):
+                message = AgentMessage(**msg_data)
+                self.add_message(new_workflow_id, message)
+            print(f"Imported workflow as {new_workflow_id}")
+            return new_workflow_id
+        except Exception as e:
+            print(f"Error importing workflow: {e}")
+            return None
+
+    # --- Realtime subscription ---
+    def subscribe_to_updates(self, workflow_id: str, callback: Callable[[str, Any], None]) -> None:
+        if workflow_id not in self._subscribers:
+            self._subscribers[workflow_id] = []
+        self._subscribers[workflow_id].append(callback)
+
+    def _notify_subscribers(self, workflow_id: str, event_type: str, data: Any) -> None:
+        for cb in self._subscribers.get(workflow_id, []):
+            try:
+                cb(event_type, data)
+            except Exception as e:
+                print(f"Error in subscriber callback: {e}")
     
     def save_data(self):
         """Save data to storage file"""

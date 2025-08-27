@@ -81,14 +81,16 @@ const WorkflowPage: React.FC = () => {
     if (newWorkflowInput.trim()) {
       setIsLoading(true);
       try {
-        await createWorkflow(newWorkflowInput.trim());
+        const wid = await createWorkflow(newWorkflowInput.trim());
         setNewWorkflowInput('');
         
-        // Select the newly created workflow - use the safe workflows array
-        const newWorkflow = workflows[workflows.length - 1];
-        if (newWorkflow) {
-          setSelectedWorkflowId(newWorkflow.id);
-          selectWorkflow(newWorkflow);
+        // Select and join the newly created workflow immediately
+        if (wid) {
+          setSelectedWorkflowId(wid);
+          const newW = { id: wid, user_input: newWorkflowInput.trim(), status: 'processing', agents: ['linkedin_workflow'], created_at: new Date().toISOString(), messages: [], agent_results: [] } as any;
+          dispatch({ type: 'SELECT_WORKFLOW', payload: newW });
+          try { joinWorkflowRoom(wid); } catch {}
+          await fetchWorkflowStatus(wid);
         }
       } catch (error) {
         console.error('Error creating workflow:', error);

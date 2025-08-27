@@ -104,7 +104,7 @@ function workflowReducer(state: WorkflowState, action: WorkflowAction): Workflow
 
 interface WorkflowContextType {
   state: WorkflowState;
-  createWorkflow: (userInput: string) => Promise<void>;
+  createWorkflow: (userInput: string) => Promise<string>;
   sendMessage: (workflowId: string, message: string) => Promise<any>;
   getWorkflowStatus: (workflowId: string) => Promise<any>;
   joinWorkflowRoom: (workflowId: string) => void;
@@ -168,7 +168,7 @@ export const WorkflowProvider: React.FC<{ children: ReactNode }> = ({ children }
     }
   };
 
-  const createWorkflow = async (userInput: string): Promise<void> => {
+  const createWorkflow = async (userInput: string): Promise<string> => {
     try {
       dispatch({ type: 'SET_LOADING', payload: true });
       
@@ -206,10 +206,11 @@ export const WorkflowProvider: React.FC<{ children: ReactNode }> = ({ children }
       if (socket) {
         socket.emit('join_workflow', { workflow_id: result.workflow_id });
       }
-      
+      return result.workflow_id as string;
     } catch (error) {
       console.error('Error creating workflow:', error);
       dispatch({ type: 'SET_ERROR', payload: 'Failed to create workflow' });
+      throw error;
     } finally {
       dispatch({ type: 'SET_LOADING', payload: false });
     }

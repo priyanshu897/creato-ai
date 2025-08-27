@@ -1,0 +1,19 @@
+{
+  "workflow": {
+    "id": "d202f697-66c9-4b4a-8c0a-eead04cba3f3",
+    "user_input": "linked in workflow",
+    "status": "processing",
+    "created_at": "2025-08-27 09:52:56.116971",
+    "updated_at": null,
+    "agents": [
+      "linkedin_workflow"
+    ],
+    "messages": [],
+    "agent_results": [],
+    "metadata": null
+  },
+  "status": "processing",
+  "messages": [],
+  "agent_results": [],
+  "saved_at": "2025-08-27T09:52:56.116971"
+}
